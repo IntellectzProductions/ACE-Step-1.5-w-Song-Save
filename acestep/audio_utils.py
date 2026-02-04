@@ -10,6 +10,9 @@ Independent audio file operations outside of handler, supporting:
 import os
 import hashlib
 import json
+import re
+import platform
+from datetime import datetime
 from pathlib import Path
 from typing import Union, Optional, List, Tuple
 import torch
@@ -297,6 +300,80 @@ def generate_uuid_from_audio_data(
     return data_hash
 
 
+def get_appdata_output_dir(app_name: str = "AceStep", subdir: str = "outputs") -> str:
+    """Return a per-user writable output directory (APPDATA/LOCALAPPDATA on Windows).
+
+    This is meant for 'normal app' behavior: stable, user-scoped storage.
+    Uses:
+      - Windows: %LOCALAPPDATA%\{app_name}\{subdir} (fallback: %APPDATA%)
+      - macOS: ~/Library/Application Support/{app_name}/{subdir}
+      - Linux: $XDG_DATA_HOME/{app_name}/{subdir} (fallback: ~/.local/share)
+    """
+    system = platform.system().lower()
+    base_dir = None
+
+    if system.startswith("win"):
+        base_dir = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    elif system == "darwin":
+        base_dir = os.path.join(Path.home(), "Library", "Application Support")
+    else:
+        base_dir = os.environ.get("XDG_DATA_HOME") or os.path.join(Path.home(), ".local", "share")
+
+    if not base_dir:
+        base_dir = str(Path.home())
+
+    out_dir = os.path.join(base_dir, app_name, subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def sanitize_filename(text: str, max_len: int = 32, default: str = "track") -> str:
+    """Make a filesystem-friendly short name."""
+    if not text:
+        return default
+    # Replace path separators and normalize whitespace
+    text = str(text).replace("\\", " ").replace("/", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    # Keep only safe chars (letters/numbers/_- and spaces)
+    text = re.sub(r"[^A-Za-z0-9 _\-]", "", text)
+    text = text.strip().lower()
+    if not text:
+        return default
+    text = text.replace(" ", "_")
+    text = re.sub(r"_+", "_", text).strip("_")
+    if len(text) > max_len:
+        text = text[:max_len].rstrip("_")
+    return text or default
+
+
+def make_short_audio_filename(
+    caption: str,
+    seed: Optional[int],
+    index: int,
+    audio_key: str,
+    ext: str,
+    prefix: str = "AceStep",
+    run_ts: Optional[str] = None,
+    caption_max_len: int = 28,
+) -> str:
+    """Create a short, human-friendly filename.
+
+    Example:
+      AceStep_20260204_153012_lofi_beat_s12345_01_a1b2c3d4.flac
+    """
+    if run_ts is None:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = sanitize_filename(caption, max_len=caption_max_len, default="track")
+    short_id = (audio_key or "")[:8] if audio_key else ""
+    seed_part = f"s{seed}" if seed is not None and seed != "" else "sna"
+    idx_part = f"{int(index)+1:02d}"
+    ext = (ext or "flac").lstrip(".").lower()
+    bits = [prefix, run_ts, slug, seed_part, idx_part]
+    if short_id:
+        bits.append(short_id)
+    return "_".join(bits) + f".{ext}"
+
+
 # Global default instance
 _default_saver = AudioSaver(default_format="flac")
 
@@ -324,4 +401,3 @@ def save_audio(
     return _default_saver.save_audio(
         audio_data, output_path, sample_rate, format, channels_first
     )
-

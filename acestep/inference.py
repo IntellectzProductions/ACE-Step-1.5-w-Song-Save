@@ -9,11 +9,13 @@ backward-compatible Gradio UI support.
 import math
 import os
 import tempfile
+import shutil
+from datetime import datetime
 from typing import Optional, Union, List, Dict, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from loguru import logger
 
-from acestep.audio_utils import AudioSaver, generate_uuid_from_params
+from acestep.audio_utils import AudioSaver, generate_uuid_from_params, get_appdata_output_dir, make_short_audio_filename
 
 # HuggingFace Space environment detection
 IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
@@ -251,7 +253,7 @@ def _update_metadata_from_lm(
     vocal_language: str,
     caption: str,
     lyrics: str,
-) -> Tuple[Optional[int], str, str, Optional[float], str, str, str]:
+) -> Tuple[Optional[int], str, str, Optional[float]]:
     """Update metadata fields from LM output if not provided by user."""
 
     if bpm is None and metadata.get('bpm'):
@@ -295,7 +297,7 @@ def generate_music(
     llm_handler,
     params: GenerationParams,
     config: GenerationConfig,
-    save_dir: Optional[str] = None,
+    save_dir: Optional[str] = "./music_out",
     progress=None,
 ) -> GenerationResult:
     """Generate music using ACE-Step model with optional LM reasoning.
@@ -347,20 +349,10 @@ def generate_music(
         # Use config.seed if provided, otherwise fallback to params.seed
         # Convert config.seed (None, int, or List[int]) to format that prepare_seeds accepts
         seed_for_generation = ""
-        # Original code (commented out because it crashes on int seeds):
-        # if config.seeds is not None and len(config.seeds) > 0:
-        #     if isinstance(config.seeds, list):
-        #         # Convert List[int] to comma-separated string
-        #         seed_for_generation = ",".join(str(s) for s in config.seeds)
-
-        if config.seeds is not None:
-            if isinstance(config.seeds, list) and len(config.seeds) > 0:
+        if config.seeds is not None and len(config.seeds) > 0:
+            if isinstance(config.seeds, list):
                 # Convert List[int] to comma-separated string
                 seed_for_generation = ",".join(str(s) for s in config.seeds)
-            elif isinstance(config.seeds, int):
-                # Fix: Explicitly handle single integer seeds by converting to string.
-                # Previously, this would crash because 'len()' was called on an int.
-                seed_for_generation = str(config.seeds)
 
         # Use dit_handler.prepare_seeds to handle seed list generation and padding
         # This will handle all the logic: padding with random seeds if needed, etc.
@@ -378,7 +370,7 @@ def generate_music(
         # 3. use_cot_language=True: detect vocal language via CoT
         # 4. use_cot_metas=True: fill missing metadata via CoT
         need_lm_for_cot = params.use_cot_caption or params.use_cot_language or params.use_cot_metas
-        use_lm = (params.thinking or need_lm_for_cot) and llm_handler is not None and llm_handler.llm_initialized and params.task_type not in skip_lm_tasks
+        use_lm = (params.thinking or need_lm_for_cot) and llm_handler.llm_initialized and params.task_type not in skip_lm_tasks
         lm_status = []
         
         if params.task_type in skip_lm_tasks:
@@ -610,10 +602,18 @@ def generate_music(
         audio_format = config.audio_format if config.audio_format else "flac"
         audio_saver = AudioSaver(default_format=audio_format)
 
-        # Use handler's temp_dir for saving files
-        if save_dir is not None:
-            os.makedirs(save_dir, exist_ok=True)
+        # Prepare output directories (local + AppData)
+        # - local: user-provided save_dir (or default ./music_out)
+        # - appdata: per-user writable directory so the app behaves like normal software
+        if not save_dir:
+            save_dir = os.environ.get("ACESTEP_OUTPUT_DIR", "./music_out")
+        os.makedirs(save_dir, exist_ok=True)
 
+        # Allow overriding AppData output dir via env, otherwise use OS-appropriate default
+        appdata_save_dir = os.environ.get("ACESTEP_APPDATA_DIR")
+        if not appdata_save_dir:
+            appdata_save_dir = get_appdata_output_dir(app_name="AceStep", subdir="outputs")
+        os.makedirs(appdata_save_dir, exist_ok=True)
         # Build audios list for GenerationResult with params and save files
         # Audio saving and UUID generation handled here, outside of handler
         audios = []
@@ -641,22 +641,75 @@ def generate_music(
 
             audio_key = generate_uuid_from_params(audio_params)
 
-            # Save audio file (handled outside handler)
+            # Save audio file (local + AppData)
             audio_path = None
-            if audio_tensor is not None and save_dir is not None:
+            appdata_audio_path = None
+
+            if audio_tensor is not None:
                 try:
-                    audio_file = os.path.join(save_dir, f"{audio_key}.{audio_format}")
-                    audio_path = audio_saver.save_audio(audio_tensor,
-                                                        audio_file,
-                                                        sample_rate=sample_rate,
-                                                        format=audio_format,
-                                                        channels_first=True)
+                    # Short, human-friendly filename instead of long UUID
+                    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    caption_for_name = (audio_params.get("caption") or params.caption or "")
+                    seed_for_name = audio_params.get("seed")
+                    file_name = make_short_audio_filename(
+                        caption=caption_for_name,
+                        seed=seed_for_name,
+                        index=idx,
+                        audio_key=audio_key,
+                        ext=audio_format,
+                        prefix="AceStep",
+                        run_ts=run_ts,
+                    )
+
+                    local_file = os.path.join(save_dir, file_name) if save_dir else None
+                    appdata_file = os.path.join(appdata_save_dir, file_name) if appdata_save_dir else None
+
+                    # 1) Save to local output folder (primary)
+                    if local_file:
+                        audio_path = audio_saver.save_audio(
+                            audio_tensor,
+                            local_file,
+                            sample_rate=sample_rate,
+                            format=audio_format,
+                            channels_first=True,
+                        )
+
+                    # 2) Also save/copy to AppData
+                    if appdata_file:
+                        if audio_path and os.path.exists(audio_path):
+                            try:
+                                shutil.copy2(audio_path, appdata_file)
+                                appdata_audio_path = appdata_file
+                            except Exception as copy_err:
+                                logger.warning(f"[generate_music] AppData copy failed, saving again: {copy_err}")
+                                appdata_audio_path = audio_saver.save_audio(
+                                    audio_tensor,
+                                    appdata_file,
+                                    sample_rate=sample_rate,
+                                    format=audio_format,
+                                    channels_first=True,
+                                )
+                        else:
+                            # Local save failed; try AppData directly
+                            appdata_audio_path = audio_saver.save_audio(
+                                audio_tensor,
+                                appdata_file,
+                                sample_rate=sample_rate,
+                                format=audio_format,
+                                channels_first=True,
+                            )
+
+                    # If local save failed but AppData succeeded, use AppData as primary path
+                    if (not audio_path) and appdata_audio_path:
+                        audio_path = appdata_audio_path
+
                 except Exception as e:
                     logger.error(f"[generate_music] Failed to save audio file: {e}")
                     audio_path = ""  # Fallback to empty path
-
+                    appdata_audio_path = ""
             audio_dict = {
-                "path": audio_path or "",  # File path (saved here, not in handler)
+                "path": audio_path or "",  # Primary file path
+                "appdata_path": appdata_audio_path or "",  # Secondary copy saved in AppData
                 "tensor": audio_tensor,  # Audio tensor [channels, samples], CPU, float32
                 "key": audio_key,
                 "sample_rate": sample_rate,
